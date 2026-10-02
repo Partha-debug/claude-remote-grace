@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="theme-color" content="#f7f6f2" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1a1918" media="(prefers-color-scheme: dark)">
+<meta name="color-scheme" content="light dark">
+<title>Claude Remote</title>
+<link rel="preload" href="static/fonts/crmono-regular.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="static/vendor/xterm.css">
+<link rel="stylesheet" href="static/app.css?v=20261002154446">
+</head>
+<body>
+<div id="app">
+  <header id="topbar">
+    <button id="menubtn" class="iconbtn" aria-label="Conversations and job" title="Conversations and job">
+      <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
+    </button>
+    <div id="where">
+      <span id="dot" class="dot connecting" title="connection"></span>
+      <span id="node">connecting…</span>
+      <span id="left" class="pill" hidden></span>
+    </div>
+    <nav id="tabs" class="seg" role="tablist">
+      <button role="tab" data-tab="chat" class="on">Chat</button>
+      <button role="tab" data-tab="term">Terminal</button>
+    </nav>
+  </header>
+  <div id="banner" hidden></div>
+
+  <main>
+    <!-- ── chat ─────────────────────────────────────────────────────────── -->
+    <section id="chat" class="pane">
+      <div id="chips">
+        <label class="chip select" title="Model — sends /model">
+          <span class="ico"><svg viewBox="0 0 24 24"><path d="M12 3l2.4 5.6L20 11l-5.6 2.4L12 19l-2.4-5.6L4 11l5.6-2.4z"/></svg></span>
+          <span id="st-model">model</span><span class="caret">▾</span>
+          <select id="pick-model"><option value="">Switch model…</option><option>opus</option><option>sonnet</option><option>haiku</option><option>fable</option><option value="default">default</option></select>
+        </label>
+        <label class="chip select" title="Effort — sends /effort">
+          <span class="ico"><svg viewBox="0 0 24 24"><path d="M4 18h3v-4H4zM10.5 18h3V9h-3zM17 18h3V5h-3z"/></svg></span>
+          <span id="st-effort">effort</span><span class="caret">▾</span>
+          <select id="pick-effort"><option value="">Set effort…</option><option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option></select>
+        </label>
+        <button id="modechip" class="chip" title="Permission mode — tap to cycle (Shift+Tab)">
+          <span class="ico"><svg viewBox="0 0 24 24"><path d="M12 3l7 3v6c0 4.5-3 7.7-7 9-4-1.3-7-4.5-7-9V6z"/></svg></span>
+          <span id="st-mode">mode</span>
+        </button>
+        <button id="ctxchip" class="chip" hidden title="Context window used — tap to compact">
+          <span class="ring" aria-hidden="true"></span><span id="st-ctx"></span>
+        </button>
+      </div>
+
+      <div id="scroller">
+        <div id="msgs">
+          <button id="earlier" class="ghost" hidden>Load earlier messages</button>
+        </div>
+        <div id="streams"></div>
+        <div id="empty" class="empty" hidden>
+          <div class="spark">✻</div>
+          <div class="empty-title">Claude is ready</div>
+          <div class="empty-sub" id="empty-sub"></div>
+        </div>
+      </div>
+      <button id="jump" class="fab" hidden aria-label="Jump to latest">
+        <svg viewBox="0 0 24 24"><path d="M12 5v14M6 13l6 6 6-6"/></svg><span id="unread"></span>
+      </button>
+
+      <div id="dock">
+        <div id="working" hidden><span class="spinner">✻</span><span id="working-text"></span><span id="working-time"></span></div>
+        <div id="cards"></div>
+        <div id="menucard" class="card" hidden></div>
+        <div id="heldnote" hidden></div>
+        <div id="attachments" hidden></div>
+        <div id="compose">
+          <button id="attach" class="iconbtn" aria-label="Attach files" title="Attach files for Claude to read">
+            <svg viewBox="0 0 24 24"><path d="M20 11.5l-7.8 7.8a5 5 0 01-7.1-7.1l8.5-8.5a3.3 3.3 0 014.7 4.7l-8.5 8.5a1.7 1.7 0 01-2.4-2.4l7.8-7.8"/></svg>
+          </button>
+          <input id="filepick" type="file" multiple hidden>
+          <textarea id="composer" rows="1" enterkeyhint="send" placeholder="Message Claude…"></textarea>
+          <button id="sendbtn" class="iconbtn primary" aria-label="Send">
+            <svg class="i-send" viewBox="0 0 24 24"><path d="M12 19V5M6 11l6-6 6 6"/></svg>
+            <svg class="i-stop" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>
+          </button>
+        </div>
+        <div id="hint">Slash commands work here too — <code>/compact</code>, <code>/model</code>, <code>/effort</code>…</div>
+      </div>
+    </section>
+
+    <!-- ── terminal ─────────────────────────────────────────────────────── -->
+    <section id="term" class="pane" hidden>
+      <div id="termtabs"></div>
+      <div id="xterm-wrap"><div id="xterm"></div></div>
+      <div id="keys">
+        <button data-key="esc">Esc</button>
+        <button data-key="tab">Tab</button>
+        <button data-key="btab">⇧Tab</button>
+        <button data-key="ctrl" class="mod">Ctrl</button>
+        <button data-key="up" aria-label="Up">↑</button>
+        <button data-key="down" aria-label="Down">↓</button>
+        <button data-key="left" aria-label="Left">←</button>
+        <button data-key="right" aria-label="Right">→</button>
+        <button data-key="ctrlc">^C</button>
+        <button data-key="ctrld">^D</button>
+        <button data-key="paste">Paste</button>
+        <button data-key="smaller" aria-label="Smaller text">A−</button>
+        <button data-key="bigger" aria-label="Larger text">A+</button>
+        <button data-key="enter" aria-label="Enter">⏎</button>
+      </div>
+    </section>
+  </main>
+
+  <!-- bottom sheet: conversations + job -->
+  <div id="backdrop" hidden></div>
+  <div id="sheet" role="dialog" aria-modal="true" hidden>
+    <div class="grab"></div>
+    <div class="sheet-section">
+      <div class="sheet-title">Conversations in this folder</div>
+      <div id="sessions" class="list"></div>
+      <button id="newconv" class="wide">New conversation <span class="muted">(/clear)</span></button>
+    </div>
+    <div class="sheet-section">
+      <div class="sheet-title">Job</div>
+      <div id="jobinfo" class="kv"></div>
+      <div class="row">
+        <button id="copylink">Copy link</button>
+        <button id="notifbtn">Enable notifications</button>
+        <button id="endjob" class="danger">End job</button>
+      </div>
+    </div>
+  </div>
+  <div id="toasts" aria-live="polite"></div>
+  <div id="lightbox" hidden><img alt=""></div>
+</div>
+
+<script src="static/vendor/xterm.js"></script>
+<script src="static/vendor/addon-fit.js"></script>
+<script src="static/vendor/addon-unicode11.js"></script>
+<script src="static/vendor/addon-webgl.js"></script>
+<script src="static/vendor/marked.min.js"></script>
+<script src="static/vendor/purify.min.js"></script>
+<script src="static/vendor/highlight.min.js"></script>
+<script src="static/ui.js?v=20261002154446"></script>
+<script src="static/chat.js?v=20261002154446"></script>
+<script src="static/terminal.js?v=20261002154446"></script>
+<script src="static/app.js?v=20261002154446"></script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+#!/bin/bash
+# cr-send PATH [PATH…] [-m "caption"] — show files to the user in the claude-remote web chat.
+set -u
+caption=""
+paths=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -m|--message) caption="${2:-}"; shift 2 ;;
+    -h|--help) echo 'usage: cr-send PATH [PATH…] [-m "caption"]'; exit 0 ;;
+    *) paths+=("$1"); shift ;;
+  esac
+done
+[[ ${#paths[@]} -gt 0 ]] || { echo "cr-send: no files given" >&2; exit 2; }
+if [[ ! -S "${CR_HOOK_SOCK:-}" ]]; then
+  echo "cr-send: not running under claude-remote (no web chat to send to)" >&2; exit 1
+fi
+abs=()
+for p in "${paths[@]}"; do
+  [[ -r "$p" && -f "$p" ]] || { echo "cr-send: not a readable file: $p" >&2; exit 1; }
+  abs+=("$(readlink -f "$p")")
+done
+body=$(python3 -c 'import json,sys; print(json.dumps({"paths": sys.argv[2:], "caption": sys.argv[1]}))' "$caption" "${abs[@]}")
+resp=$(printf '%s' "$body" | curl -s --noproxy '*' -m 30 --unix-socket "$CR_HOOK_SOCK" \
+         -H 'Content-Type: application/json' --data-binary @- http://cr/share)
+if [[ -z "$resp" ]]; then echo "cr-send: the web chat server did not answer" >&2; exit 1; fi
+echo "$resp"

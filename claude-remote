@@ -1,0 +1,445 @@
+#!/bin/bash
+# ─────────────────────────────────────────────────────────────────────────────
+# claude-remote — run Claude Code inside a Grace SLURM job and use it from this
+# terminal or from any browser (phone included) through the OnDemand portal.
+#
+# Usage:
+#   claude-remote [wrapper flags] [--] [claude args…]
+#   claude-remote -n 2 -t 8 -m 16 --resume              # resume picker for THIS folder
+#   claude-remote -t 4 -c --dangerously-skip-permissions
+#   claude-remote -status | -attach [JOBID] | -kill [JOBID]
+#
+# Wrapper flags are read only up to the first token that is not one of them;
+# everything after that is passed to `claude` untouched.
+# Support files live in claude-remote.d/ next to this script.
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+HERE="$(dirname "$(readlink -f "$0")")/claude-remote.d"
+STATE="${SCRATCH:-$HOME}/.claude-remote"
+PORTAL="https://portal-grace.hprc.tamu.edu"
+JOB_NAME="claude-remote"
+
+# Compute nodes have no tmux, so the job uses a copy of the login node's (not kept in git:
+# it is machine-specific). Recreate it if missing.
+if [[ ! -x "$HERE/bin/tmux" ]]; then
+  if TMUX_SRC=$(command -v tmux); then
+    mkdir -p "$HERE/bin" && cp "$TMUX_SRC" "$HERE/bin/tmux" && chmod 755 "$HERE/bin/tmux"
+    echo "claude-remote: copied $TMUX_SRC to $HERE/bin/tmux (used inside the job)"
+  else
+    echo "claude-remote: tmux not found — copy a tmux (3.3 or newer) binary to $HERE/bin/tmux" >&2
+    exit 1
+  fi
+fi
+if [[ "$("$HERE/bin/tmux" -V 2>/dev/null)" =~ ([0-9]+)\.([0-9]+) ]] &&
+   (( BASH_REMATCH[1] < 3 || (BASH_REMATCH[1] == 3 && BASH_REMATCH[2] < 3) )); then
+  echo "claude-remote: $HERE/bin/tmux is older than 3.3; replace it with a newer tmux" >&2
+  exit 1
+fi
+
+for f in job.sh run_claude.sh claude_env.sh tmux.conf bin/tmux server/app.py static/index.html; do
+  if [[ ! -e "$HERE/$f" ]]; then
+    echo "claude-remote: support file missing: $HERE/$f" >&2
+    echo "  (claude-remote.d/ must sit next to the claude-remote script)" >&2
+    exit 1
+  fi
+done
+
+mkdir -p -m 700 "$STATE/jobs"
+chmod 700 "$STATE"
+
+# Defaults
+NPROCS=16
+TIME="02:00:00"
+TIME_MIN=120
+MEM="16G"
+ACCOUNT=""
+PARTITION=""
+EXTRA_SBATCH=()
+ATTACH=1
+EMAIL=""
+MODE="launch"
+TARGET_JOB=""
+DRYRUN=0
+
+usage() {
+  cat <<'EOF'
+Usage: claude-remote [wrapper flags] [--] [claude args…]
+
+Runs Claude Code in a SLURM job on Grace, in the current folder. Attach from
+this terminal, or open the printed link in any browser (on campus or on the
+TAMU VPN) — the OnDemand portal login (NetID + Duo) is the only login.
+
+Wrapper flags (must come first):
+  -n N              cores (N must be a number)              (default 16)
+  -t T              wall time: hours (2, 1.5) or HH:MM:SS / D-HH:MM:SS (default 2)
+  -m G              memory, GB or with unit (8, 16G, 4000M)  (default 16)
+  -A ACCOUNT        SLURM account
+  -partition P      partition (default chosen from -t: short/medium/long/xlong)
+  -sbatch '--x=y'   extra sbatch option (repeatable)
+  -email ADDR       email the link and alerts to ADDR (off by default)
+  -noattach         print the link and exit instead of attaching
+  -dryrun           show what would be submitted, without submitting
+
+Other commands:
+  -status           list running claude-remote jobs (node, time left, folder, link)
+  -attach [JOBID]   attach this terminal to a running job
+  -kill [JOBID]     cancel a job
+  -h                this help;  claude-remote -- --help  shows claude's own help
+
+Everything else goes to claude unchanged, for example:
+  -c / --continue   continue this folder's most recent conversation
+  -r / --resume     pick an earlier conversation of this folder (or -r ID)
+  --model opus, --dangerously-skip-permissions, --permission-mode plan, …
+Claude's own -n NAME (session name) still works: -n followed by something
+that is not a number is passed to claude.
+Detach from the terminal view with  Ctrl-] d  (Claude keeps running).
+EOF
+}
+
+die() { echo "claude-remote: $*" >&2; exit 1; }
+
+parse_time() {
+  local t="$1"
+  if [[ "$t" =~ ^[0-9]+$ ]]; then
+    TIME=$(printf "%02d:00:00" "$t"); TIME_MIN=$((t * 60))
+  elif [[ "$t" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+    local m
+    m=$(awk -v h="$t" 'BEGIN{printf "%d", h*60+0.5}')
+    TIME=$(printf "%02d:%02d:00" $((m / 60)) $((m % 60))); TIME_MIN=$m
+  elif [[ "$t" =~ ^([0-9]+)-([0-9]+):([0-9]+):([0-9]+)$ ]]; then
+    TIME="$t"; TIME_MIN=$((10#${BASH_REMATCH[1]} * 1440 + 10#${BASH_REMATCH[2]} * 60 + 10#${BASH_REMATCH[3]}))
+  elif [[ "$t" =~ ^([0-9]+):([0-9]+):([0-9]+)$ ]]; then
+    TIME="$t"; TIME_MIN=$((10#${BASH_REMATCH[1]} * 60 + 10#${BASH_REMATCH[2]}))
+  else
+    die "bad -t value '$t' (use hours like 4 or 1.5, or HH:MM:SS, or D-HH:MM:SS)"
+  fi
+}
+
+# ── wrapper flags (front only) ───────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|-np)
+      # a number means cores; anything else is Claude's own -n/--name, so stop and hand over to claude
+      if [[ "${2:-}" =~ ^[0-9]+$ ]]; then NPROCS="$2"; shift 2
+      elif [[ "$1" == "-n" ]]; then break
+      else die "-np needs a number"; fi ;;
+    -t)         [[ -n "${2:-}" ]] || die "-t needs a value"; parse_time "$2"; shift 2 ;;
+    -m|-mem)
+      [[ -n "${2:-}" ]] || die "-m needs a value (GB, e.g. -m 16)"
+      if [[ "$2" =~ ^[0-9]+$ ]]; then MEM="${2}G"
+      elif [[ "$2" =~ ^[0-9]+[KMGTkmgt]$ ]]; then MEM="${2^^}"
+      else die "bad -m value '$2' (use GB like 16, or 16G / 4000M)"; fi
+      shift 2 ;;
+    -A)         [[ -n "${2:-}" ]] || die "-A needs an account"; ACCOUNT="$2"; shift 2 ;;
+    -partition) [[ -n "${2:-}" ]] || die "-partition needs a name"; PARTITION="$2"; shift 2 ;;
+    -sbatch)    [[ "${2:-}" == --* ]] || die "-sbatch takes one option like '--qos=x'"; EXTRA_SBATCH+=("$2"); shift 2 ;;
+    -email)     [[ "${2:-}" == *@* ]] || die "-email needs an address"; EMAIL="$2"; shift 2 ;;
+    -noattach)  ATTACH=0; shift ;;
+    -dryrun)    DRYRUN=1; shift ;;
+    -status)    MODE="status"; shift ;;
+    -attach)    MODE="attach"; shift; if [[ "${1:-}" =~ ^[0-9]+$ ]]; then TARGET_JOB="$1"; shift; fi ;;
+    -kill)      MODE="kill";   shift; if [[ "${1:-}" =~ ^[0-9]+$ ]]; then TARGET_JOB="$1"; shift; fi ;;
+    -h)         usage; exit 0 ;;
+    --)         shift; break ;;
+    *)          break ;;
+  esac
+done
+CLAUDE_ARGS=("$@")
+
+# claude-remote flags placed after claude's arguments would be handed to claude (which rejects
+# them only after the job has started) — catch that here instead.
+for ((i = 0; i < ${#CLAUDE_ARGS[@]}; i++)); do
+  a="${CLAUDE_ARGS[$i]}"; next="${CLAUDE_ARGS[$((i + 1))]:-}"
+  case "$a" in
+    -use)
+      die "-use was removed: claude-remote runs on CPU nodes (if you really need another node type, use -partition/-sbatch)" ;;
+    -t|-m|-np|-mem|-A|-partition|-sbatch|-email|-noattach|-dryrun|-status|-attach|-kill)
+      die "'$a' is a claude-remote flag: put it before claude's arguments, e.g.  claude-remote $a${next:+ $next} ${CLAUDE_ARGS[0]} …" ;;
+    -n)
+      [[ "$next" =~ ^[0-9]+$ ]] && die "'-n $next' after claude's arguments would become Claude's session name. For cores, put it first: claude-remote -n $next ${CLAUDE_ARGS[0]} …   (for a session named '$next', use --name $next)" ;;
+  esac
+done
+
+# ── helpers for running jobs ─────────────────────────────────────────────────
+# Each launch has a folder $STATE/jobs/<launch-id>/ containing `jobid` once submitted.
+launch_dir_for_job() {
+  local id="$1" d
+  for d in "$STATE"/jobs/*/; do
+    [[ -f "$d/jobid" && "$(cat "$d/jobid")" == "$id" ]] && { echo "${d%/}"; return 0; }
+  done
+  return 1
+}
+
+json_field() {  # json_field FILE KEY
+  python3 -c 'import json,sys; v=json.load(open(sys.argv[1])).get(sys.argv[2],""); print(v)' "$1" "$2" 2>/dev/null || true
+}
+
+running_jobs() {  # prints: JOBID STATE NODE TIMELEFT
+  squeue -u "$USER" -n "$JOB_NAME" -h -o "%i %T %N %L" 2>/dev/null || true
+}
+
+pick_job() {  # pick_job "verb" → sets PICKED
+  local verb="$1" lines=() i sel=0 key rest
+  mapfile -t lines < <(running_jobs)
+  [[ ${#lines[@]} -gt 0 ]] || die "no running claude-remote jobs"
+  if [[ ${#lines[@]} -eq 1 || ! -t 0 ]]; then PICKED="${lines[0]%% *}"; return; fi
+  local labels=()
+  for i in "${!lines[@]}"; do
+    local id="${lines[$i]%% *}" d cwd=""
+    d=$(launch_dir_for_job "$id" || true)
+    [[ -n "$d" && -f "$d/launch.env" ]] && cwd=$(grep '^CR_CWD=' "$d/launch.env" | cut -d= -f2-)
+    labels+=("${lines[$i]}  ${cwd}")
+  done
+  echo "  Select a job to $verb (↑/↓, Enter; q to cancel):"
+  tput civis 2>/dev/null || true
+  trap 'tput cnorm 2>/dev/null || true' RETURN
+  draw() { [[ $1 -ne 0 ]] && tput cuu "${#labels[@]}" 2>/dev/null
+    for i in "${!labels[@]}"; do tput el 2>/dev/null
+      if [[ $i -eq $sel ]]; then echo -e "  \033[1;32m▸ ${labels[$i]}\033[0m"; else echo "    ${labels[$i]}"; fi
+    done; }
+  draw 0
+  while true; do
+    IFS= read -rsn1 key
+    case "$key" in
+      $'\x1b') read -rsn2 -t 0.1 rest || true
+        case "$rest" in '[A') ((sel > 0)) && sel=$((sel - 1)) ;; '[B') ((sel < ${#labels[@]} - 1)) && sel=$((sel + 1)) ;; esac ;;
+      '') break ;;
+      k) ((sel > 0)) && sel=$((sel - 1)) ;;
+      j) ((sel < ${#labels[@]} - 1)) && sel=$((sel + 1)) ;;
+      q) echo "Cancelled."; exit 0 ;;
+    esac
+    draw 1
+  done
+  PICKED="${lines[$sel]%% *}"
+}
+
+attach_job() {  # attach_job JOBID
+  local id="$1" d node sock
+  d=$(launch_dir_for_job "$id") || die "job $id is not a claude-remote job I know about"
+  [[ -f "$d/conn.json" ]] || die "job $id has not finished starting yet (try again in a moment)"
+  node=$(json_field "$d/conn.json" node)
+  sock=$(json_field "$d/conn.json" tmux_sock)
+  echo "Attaching to Claude on $node (takes ~10 s)…  detach with Ctrl-] d · show the web link with Ctrl-] l"
+  # TERM fallback if the node has no terminfo entry for this terminal
+  ssh -q -t -o LogLevel=ERROR "$node" \
+    "infocmp \"\$TERM\" >/dev/null 2>&1 || export TERM=xterm-256color; exec '$HERE/bin/tmux' -S '$sock' attach -t claude"
+  if squeue -j "$id" -h -o %T 2>/dev/null | grep -q RUNNING; then
+    echo
+    echo "Detached — Claude keeps running in job $id on $node."
+    echo "  Web:       $(json_field "$d/conn.json" url)"
+    echo "  Re-attach: claude-remote -attach $id"
+  else
+    echo "The claude-remote job $id has ended."
+  fi
+}
+
+# claude-remote -r [search]: pick the conversation here, before submitting. (Claude's own picker
+# would only appear inside the job — hidden behind the attached terminal, and the web chat can't
+# use it — so the job instead starts with --resume <id> directly.)
+pick_session() {  # pick_session [SEARCH] → sets PICKED_SESSION ("" = new conversation)
+  local search="$1" ids=() labels=() id label sel=0 key rest i cols max=15
+  cols=$(tput cols 2>/dev/null || echo 100)
+  while IFS=$'\t' read -r id label; do
+    ids+=("$id"); labels+=("${label:0:$((cols - 8))}")
+  done < <("$PY" "$HERE/server/sessions.py" "$CWD" ${search:+"$search"} 2>/dev/null | head -n $max)
+  if [[ ${#ids[@]} -eq 0 ]]; then
+    [[ -n "$search" ]] && die "no conversation in this folder matches '$search'"
+    echo "No earlier conversations in this folder — starting a new one."
+    PICKED_SESSION=""; return 0
+  fi
+  ids+=(""); labels+=("+ New conversation")
+  echo "  Conversations in $CWD${search:+ matching '$search'}  (↑/↓, Enter; q to cancel):"
+  tput civis 2>/dev/null || true
+  draw() { [[ $1 -ne 0 ]] && tput cuu "${#labels[@]}" 2>/dev/null
+    for i in "${!labels[@]}"; do tput el 2>/dev/null
+      if [[ $i -eq $sel ]]; then echo -e "  \033[1;32m▸ ${labels[$i]}\033[0m"; else echo "    ${labels[$i]}"; fi
+    done; }
+  draw 0
+  while true; do
+    IFS= read -rsn1 key
+    case "$key" in
+      $'\x1b') read -rsn2 -t 0.1 rest || true
+        case "$rest" in '[A') ((sel > 0)) && sel=$((sel - 1)) ;; '[B') ((sel < ${#labels[@]} - 1)) && sel=$((sel + 1)) ;; esac ;;
+      '') break ;;
+      k) ((sel > 0)) && sel=$((sel - 1)) ;;
+      j) ((sel < ${#labels[@]} - 1)) && sel=$((sel + 1)) ;;
+      q) tput cnorm 2>/dev/null; echo "Cancelled."; return 1 ;;
+    esac
+    draw 1
+  done
+  tput cnorm 2>/dev/null || true
+  PICKED_SESSION="${ids[$sel]}"
+}
+
+case "$MODE" in
+  status)
+    mapfile -t lines < <(running_jobs)
+    if [[ ${#lines[@]} -eq 0 ]]; then echo "No claude-remote jobs."; exit 0; fi
+    for l in "${lines[@]}"; do
+      read -r id st node left <<<"$l"
+      d=$(launch_dir_for_job "$id" || true)
+      cwd=""; url=""
+      [[ -n "$d" && -f "$d/launch.env" ]] && cwd=$(grep '^CR_CWD=' "$d/launch.env" | cut -d= -f2-)
+      [[ -n "$d" && -f "$d/conn.json" ]] && url=$(json_field "$d/conn.json" url)
+      echo "job $id  $st  node ${node:--}  left ${left:--}"
+      echo "    folder: ${cwd:-?}"
+      [[ -n "$url" ]] && echo "    web:    $url"
+    done
+    exit 0 ;;
+  attach)
+    [[ -n "$TARGET_JOB" ]] || { pick_job attach; TARGET_JOB="$PICKED"; }
+    attach_job "$TARGET_JOB"
+    exit 0 ;;
+  kill)
+    [[ -n "$TARGET_JOB" ]] || { pick_job cancel; TARGET_JOB="$PICKED"; }
+    launch_dir_for_job "$TARGET_JOB" >/dev/null || die "job $TARGET_JOB is not a claude-remote job"
+    scancel "$TARGET_JOB" && echo "Cancelled job $TARGET_JOB."
+    exit 0 ;;
+esac
+
+# ── launch ───────────────────────────────────────────────────────────────────
+# Claude's own help/version run here; things that make no sense in a job are refused.
+for a in "${CLAUDE_ARGS[@]}"; do
+  case "$a" in
+    -h|--help|-v|--version) exec claude "${CLAUDE_ARGS[@]}" ;;
+    -p|--print) die "-p/--print is a one-shot batch run; submit 'claude -p …' with sbatch directly instead" ;;
+    --bg|--background) die "--bg makes no sense here: the job itself is the background session" ;;
+  esac
+done
+if [[ ${#CLAUDE_ARGS[@]} -gt 0 ]]; then
+  case "${CLAUDE_ARGS[0]}" in
+    agents|attach|auth|auto-mode|doctor|gateway|import|install|logs|mcp|plugin|plugins|project|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade|remote-control)
+      die "'claude ${CLAUDE_ARGS[0]}' is a management command — run it with plain claude on the login node" ;;
+  esac
+fi
+
+# The job must be able to see this folder (sessions are filed per folder).
+CWD="$(pwd -P)"
+case "$CWD" in
+  /scratch/*|/home/*) ;;
+  *) die "this folder ($CWD) is not visible from compute nodes; run from /scratch or /home" ;;
+esac
+[[ "$CWD" =~ [[:space:]] ]] && die "folder paths with spaces are not supported: $CWD"
+
+PY="${CR_PYTHON:-/sw/eb/sw/Anaconda3/2025.12-2/bin/python}"
+UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+for ((i = 0; i < ${#CLAUDE_ARGS[@]}; i++)); do
+  a="${CLAUDE_ARGS[$i]}"
+  [[ "$a" == "-r" || "$a" == "--resume" || "$a" == --resume=* ]] || continue
+  val="" drop=1
+  if [[ "$a" == --resume=* ]]; then val="${a#--resume=}"
+  elif [[ -n "${CLAUDE_ARGS[$((i + 1))]:-}" && "${CLAUDE_ARGS[$((i + 1))]}" != -* ]]; then
+    val="${CLAUDE_ARGS[$((i + 1))]}"; drop=2
+  fi
+  [[ "$val" =~ $UUID_RE ]] && break        # a specific conversation: Claude resumes it directly
+  [[ -t 0 && -t 1 ]] || break             # no terminal here: leave Claude's own picker
+  pick_session "$val" || exit 0
+  CLAUDE_ARGS=("${CLAUDE_ARGS[@]:0:$i}" "${CLAUDE_ARGS[@]:$((i + drop))}")
+  [[ -n "$PICKED_SESSION" ]] && CLAUDE_ARGS=(--resume "$PICKED_SESSION" "${CLAUDE_ARGS[@]}")
+  break
+done
+
+if [[ -z "$PARTITION" ]]; then
+  if ((TIME_MIN <= 120)); then PARTITION="short"
+  elif ((TIME_MIN <= 1440)); then PARTITION="medium"
+  elif ((TIME_MIN <= 10080)); then PARTITION="long"
+  else PARTITION="xlong"; fi
+fi
+
+# Prune launch folders older than 14 days whose job is gone.
+find "$STATE/jobs" -mindepth 1 -maxdepth 1 -type d -mtime +14 -exec rm -rf {} + 2>/dev/null || true
+
+LAUNCH_ID="$(date +%Y%m%d-%H%M%S)-$$"
+DIR="$STATE/jobs/$LAUNCH_ID"
+mkdir -m 700 "$DIR"
+[[ $DRYRUN -eq 1 ]] && trap 'rm -rf "$DIR"' EXIT   # a dry run leaves nothing behind, even if interrupted
+
+# Claude args, NUL-delimited: no quoting ever touches them.
+( umask 077; printf '%s\0' "${CLAUDE_ARGS[@]}" > "$DIR/args.bin" )
+( umask 077; {
+  echo "CR_CWD=$CWD"
+  echo "CR_HERE=$HERE"
+  echo "CR_PORTAL=$PORTAL"
+  echo "CR_EMAIL=$EMAIL"
+} > "$DIR/launch.env" )
+
+ACCOUNT_LINE=""
+[[ -n "$ACCOUNT" ]] && ACCOUNT_LINE="#SBATCH --account=$ACCOUNT"
+
+{
+  echo "#!/bin/bash"
+  echo "#SBATCH --job-name=$JOB_NAME"
+  echo "#SBATCH --time=$TIME"
+  echo "#SBATCH --ntasks=1"
+  echo "#SBATCH --cpus-per-task=$NPROCS"
+  echo "#SBATCH --mem=$MEM"
+  echo "#SBATCH --partition=$PARTITION"
+  echo "#SBATCH --output=$DIR/job.log"
+  echo "#SBATCH --chdir=$CWD"
+  echo "#SBATCH --no-requeue"
+  echo "#SBATCH --signal=B:USR1@600"
+  [[ -n "$ACCOUNT_LINE" ]] && echo "$ACCOUNT_LINE"
+  for o in "${EXTRA_SBATCH[@]}"; do echo "#SBATCH $o"; done
+  echo "exec /bin/bash '$HERE/job.sh' '$DIR'"
+} > "$DIR/sbatch.sh"
+
+if [[ $DRYRUN -eq 1 ]]; then
+  echo "Would submit ($NPROCS core$([[ $NPROCS -eq 1 ]] || echo s), $MEM, $TIME, partition $PARTITION) in $CWD"
+  printf 'claude args:'; printf ' [%s]' "${CLAUDE_ARGS[@]}"; echo
+  echo "--- $DIR/sbatch.sh"; cat "$DIR/sbatch.sh"
+  rm -rf "$DIR"
+  exit 0
+fi
+echo "Submitting Claude job ($NPROCS core$([[ $NPROCS -eq 1 ]] || echo s), $MEM, $TIME, $PARTITION) in $CWD"
+[[ ${#CLAUDE_ARGS[@]} -gt 0 ]] && echo "  claude args: ${CLAUDE_ARGS[*]}"
+# All options are inside the script: HPRC's sbatch wrapper word-splits its arguments.
+JOBID=$(/usr/bin/sbatch --parsable "$DIR/sbatch.sh") || die "sbatch failed"
+JOBID="${JOBID%%;*}"
+echo "$JOBID" > "$DIR/jobid"
+echo "Job $JOBID submitted."
+
+trap 'echo; echo "Stopped waiting. The job stays queued — check later with: claude-remote -status"; exit 0' INT
+
+echo -n "Waiting for the job to start "
+while true; do
+  st=$(squeue -j "$JOBID" -h -o "%T" 2>/dev/null || true)
+  [[ "$st" == "RUNNING" ]] && { echo " running"; break; }
+  [[ -z "$st" ]] && { echo " gone"; echo "The job ended before starting. Log: $DIR/job.log"; exit 1; }
+  echo -n "."; sleep 3
+done
+
+echo -n "Starting Claude "
+for _ in $(seq 1 120); do
+  [[ -f "$DIR/conn.json" ]] && break
+  if [[ -z "$(squeue -j "$JOBID" -h -o %T 2>/dev/null)" ]]; then
+    echo " failed"; echo "Log: $DIR/job.log"; tail -20 "$DIR/job.log" 2>/dev/null; exit 1
+  fi
+  echo -n "."; sleep 2
+done
+[[ -f "$DIR/conn.json" ]] || die "the job is running but did not report ready; see $DIR/job.log"
+echo " ready"
+
+URL=$(json_field "$DIR/conn.json" url)
+NODE=$(json_field "$DIR/conn.json" node)
+echo
+echo "════════════════════════════════════════════════════════════════"
+echo "  Claude is running on $NODE (job $JOBID)"
+echo
+echo "  Web (portal login, on campus or TAMU VPN):"
+echo "    $URL"
+[[ -n "$EMAIL" ]] && echo "    (also emailed to $EMAIL)"
+echo
+echo "  In the terminal view: Ctrl-] d detach (Claude keeps running) · Ctrl-] l show this link"
+echo "  Later: claude-remote -attach   ·   claude-remote -status   ·   claude-remote -kill"
+echo "════════════════════════════════════════════════════════════════"
+trap - INT
+
+if [[ $ATTACH -eq 1 && -t 0 && -t 1 ]]; then
+  # give time to copy the link: the terminal view covers the screen once attached
+  trap 'echo; echo "Claude keeps running. Open the link above, or attach later: claude-remote -attach $JOBID"; exit 0' INT
+  read -r -t 15 -p "  Enter = open Claude here now · Ctrl-C = keep it in the background (opens here in 15 s) " _ || echo
+  trap - INT
+  attach_job "$JOBID"
+fi

@@ -1,0 +1,212 @@
+{
+ "hooks": {
+  "SessionStart": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "${CLAUDE_PLUGIN_ROOT}/hooks/relay.sh SessionStart",
+      "async": true
+     }
+    ]
+   },
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "${CLAUDE_PLUGIN_ROOT}/hooks/session_context.sh",
+      "timeout": 5
+     }
+    ]
+   }
+  ],
+  "UserPromptSubmit": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "${CLAUDE_PLUGIN_ROOT}/hooks/relay.sh UserPromptSubmit",
+      "async": true
+     }
+    ]
+   }
+  ],
+  "UserPromptExpansion": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "${CLAUDE_PLUGIN_ROOT}/hooks/relay.sh UserPromptExpansion",
+      "async": true
+     }
+    ]
+   }
+  ],
+  "PreToolUse": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "${CLAUDE_PLUGIN_ROOT}/hooks/relay.sh PreToolUse",
+      "async": true
+     }
+    ]
+   },
+   {
+    "matcher": "Bash",
+    "hooks": [
+     {
+      "type": "command",
+      "if": "Bash(cr-send *)",
+      "command": "${CLAUDE_PLUGIN_ROOT}/hooks/allow_cr_send.sh",
+      "timeout": 5
+     }
+    ]
+   }
+  ],
+  "PostToolUse": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "${CLAUDE_PLUGIN_ROOT}/hooks/relay.sh PostToolUse",
+      "async": true
+     }
+    ]
+   }
+  ],
+  "PostToolUseFailure": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "${CLAUDE_PLUGIN_ROOT}/hooks/relay.sh PostToolUseFailure",
+      "async": true
+     }
+    ]
+   }
+  ],
+  "PermissionDenied": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "${CLAUDE_PLUGIN_ROOT}/hooks/relay.sh PermissionDenied",
+      "async": true
+     }
+    ]
+   }
+  ],
+  "Notification": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "${CLAUDE_PLUGIN_ROOT}/hooks/relay.sh Notification",
+      "async": true
+     }
+    ]
+   }
+  ],
+  "Stop": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "${CLAUDE_PLUGIN_ROOT}/hooks/relay.sh Stop",
+      "async": true
+     }
+    ]
+   }
+  ],
+  "StopFailure": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "${CLAUDE_PLUGIN_ROOT}/hooks/relay.sh StopFailure",
+      "async": true
+     }
+    ]
+   }
+  ],
+  "SubagentStart": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "${CLAUDE_PLUGIN_ROOT}/hooks/relay.sh SubagentStart",
+      "async": true
+     }
+    ]
+   }
+  ],
+  "SubagentStop": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "${CLAUDE_PLUGIN_ROOT}/hooks/relay.sh SubagentStop",
+      "async": true
+     }
+    ]
+   }
+  ],
+  "PostModelSwitch": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "${CLAUDE_PLUGIN_ROOT}/hooks/relay.sh PostModelSwitch",
+      "async": true
+     }
+    ]
+   }
+  ],
+  "PreCompact": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "${CLAUDE_PLUGIN_ROOT}/hooks/relay.sh PreCompact",
+      "async": true
+     }
+    ]
+   }
+  ],
+  "PostCompact": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "${CLAUDE_PLUGIN_ROOT}/hooks/relay.sh PostCompact",
+      "async": true
+     }
+    ]
+   }
+  ],
+  "SessionEnd": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "${CLAUDE_PLUGIN_ROOT}/hooks/relay.sh SessionEnd 1",
+      "timeout": 2
+     }
+    ]
+   }
+  ],
+  "PermissionRequest": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "${CLAUDE_PLUGIN_ROOT}/hooks/permission.sh",
+      "timeout": 86400,
+      "statusMessage": "waiting for approval (terminal or web)"
+     }
+    ]
+   }
+  ]
+ }
+}
